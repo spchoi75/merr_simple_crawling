@@ -20,12 +20,13 @@ OUTPUT_DIR = os.path.expanduser("~/승표의보관소/Web Clipping/메르의 블
 
 # 크롤링 기록 파일
 CRAWLED_POSTS_FILE = os.path.join(os.path.dirname(__file__), ".last_crawl")
+CRAWL_STATE_FILE = os.path.join(os.path.dirname(__file__), ".crawl_state")  # 마지막 크롤링 위치 저장
 
 # 크롤링 로그 저장 경로
 LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
 
 # 배치 처리 설정
-BATCH_SIZE = 100  # 전체 크롤링 시 한 번에 처리할 게시글 수
+BATCH_SIZE = 50  # 전체 크롤링 시 한 번에 처리할 게시글 수
 
 # 요청 설정
 REQUEST_DELAY = 1.0  # 요청 간 딜레이 (초) - 서버 부하 방지

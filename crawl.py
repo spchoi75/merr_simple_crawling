@@ -39,6 +39,7 @@ class NaverBlogCrawler:
             'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
         })
         self.crawled_posts = self._load_crawled_posts()
+        self.crawl_state = self._load_crawl_state()  # 마지막 크롤링 위치
         self.crawl_results = []  # 크롤링 결과 저장 (로그용)
 
     def _load_crawled_posts(self) -> set:
@@ -47,6 +48,26 @@ class NaverBlogCrawler:
             with open(config.CRAWLED_POSTS_FILE, 'r', encoding='utf-8') as f:
                 return set(line.strip() for line in f if line.strip())
         return set()
+
+    def _load_crawl_state(self) -> dict:
+        """마지막 크롤링 위치 로드 (페이지 번호, 마지막 게시글 ID)"""
+        if os.path.exists(config.CRAWL_STATE_FILE):
+            with open(config.CRAWL_STATE_FILE, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                if content:
+                    parts = content.split(',')
+                    if len(parts) >= 2:
+                        return {
+                            'last_page': int(parts[0]),
+                            'last_post_id': parts[1]
+                        }
+        return {'last_page': 1, 'last_post_id': None}
+
+    def _save_crawl_state(self, page: int, post_id: str):
+        """마지막 크롤링 위치 저장"""
+        with open(config.CRAWL_STATE_FILE, 'w', encoding='utf-8') as f:
+            f.write(f"{page},{post_id}")
+        self.crawl_state = {'last_page': page, 'last_post_id': post_id}
 
     def _save_crawled_post(self, post_id: str):
         """크롤링된 게시글 ID 저장"""
@@ -134,21 +155,44 @@ total_crawled: {len(self.crawl_results)}
             logger.error(f"페이지 요청 실패: {url} - {e}")
             return None
 
-    def get_posts_in_category(self, limit: int = None) -> list[str]:
+    def get_posts_in_category(self, limit: int = None, batch_size: int = None, start_page: int = None, stop_on_crawled: bool = False) -> tuple[list[str], int, bool]:
         """대상 카테고리의 게시글 ID 수집 (PC 버전 사용)
+
+        저장된 마지막 페이지부터 시작하여 새 게시글을 수집합니다.
 
         Args:
             limit: 새 게시글 수집 개수 제한 (지정 시 새 게시글 n개 발견하면 즉시 중단)
+            batch_size: 배치 크기 (지정 시 새 게시글 batch_size개 발견하면 즉시 중단)
+            start_page: 시작 페이지 (지정하지 않으면 저장된 마지막 페이지 사용)
+            stop_on_crawled: True면 이미 크롤링된 게시글을 만나면 즉시 중단 (일일 자동화용)
+
+        Returns:
+            (새 게시글 ID 목록, 마지막으로 탐색한 페이지 번호, 전체 완료 여부)
+            - 전체 완료 = True: 더 이상 페이지가 없거나, 이미 크롤링된 게시글 발견(stop_on_crawled=True)
+            - 전체 완료 = False: batch_size 도달로 중단 (계속 진행 필요)
         """
-        posts = []
-        new_posts_count = 0
-        page = 1
+        new_posts = []  # 새 게시글만 수집
+
+        # 시작 페이지 결정: 인자 > 저장된 상태 > 1
+        if start_page is not None:
+            page = start_page
+        else:
+            page = self.crawl_state.get('last_page', 1)
+
+        if page > 1:
+            logger.info(f"저장된 위치에서 재개: 페이지 {page}부터 시작")
+
+        # limit이 있으면 limit 사용, 없으면 batch_size 사용
+        target_count = limit if limit else batch_size
+        last_page = page
+        is_complete = False  # 전체 완료 여부
 
         while True:
             url = f"https://blog.naver.com/PostList.naver?blogId={config.BLOG_ID}&categoryNo={TARGET_CATEGORY['no']}&currentPage={page}"
             soup = self._fetch_page(url, use_pc_agent=True)
 
             if not soup:
+                is_complete = True  # 페이지 로드 실패 = 끝
                 break
 
             # 글 목록 링크에서만 게시글 ID 추출 (본문 내 링크 제외)
@@ -157,38 +201,44 @@ total_crawled: {len(self.crawl_results)}
             seen_in_page = set()
             for match in re.finditer(rf'PostView\.naver\?blogId={config.BLOG_ID}&logNo=(\d+)', str(soup)):
                 post_id = match.group(1)
-                if post_id not in posts and post_id not in seen_in_page:
+                if post_id not in seen_in_page:
                     seen_in_page.add(post_id)
                     page_posts.append(post_id)
 
             if not page_posts:
+                is_complete = True  # 더 이상 게시글 없음 = 끝
                 break
 
-            # limit 모드: 새 게시글 수 체크
-            if limit:
-                for post_id in page_posts:
-                    posts.append(post_id)
-                    if post_id not in self.crawled_posts:
-                        new_posts_count += 1
-                        if new_posts_count >= limit:
-                            logger.info(f"페이지 {page}: 새 게시글 {limit}개 발견, 수집 중단")
-                            logger.info(f"총 {len(posts)}개 게시글 발견 (새 게시글: {new_posts_count}개)")
-                            return posts
-            else:
-                posts.extend(page_posts)
+            # 페이지 내 게시글 처리
+            for post_id in page_posts:
+                # 이미 크롤링된 게시글 처리
+                if post_id in self.crawled_posts:
+                    if stop_on_crawled:
+                        # 일일 자동화 모드: 이미 크롤링된 게시글을 만나면 즉시 중단
+                        logger.info(f"페이지 {page}: 이미 크롤링된 게시글 발견 (ID: {post_id}), 수집 중단")
+                        is_complete = True
+                        return new_posts, last_page, is_complete
+                    else:
+                        # 초기 크롤링 모드: 건너뛰고 계속 진행
+                        continue
 
-            logger.info(f"페이지 {page}: {len(page_posts)}개 게시글 발견 (누적: {len(posts)}개)")
+                # 새 게시글 추가 (중복 체크)
+                if post_id not in new_posts:
+                    new_posts.append(post_id)
 
+                    # target_count에 도달하면 즉시 반환 (계속 진행 필요)
+                    if target_count and len(new_posts) >= target_count:
+                        logger.info(f"페이지 {page}: 새 게시글 {target_count}개 발견, 배치 중단")
+                        return new_posts, page, False  # is_complete=False
+
+            logger.info(f"페이지 {page}: {len(page_posts)}개 게시글 확인 (새 게시글 누적: {len(new_posts)}개)")
+
+            last_page = page
             page += 1
             time.sleep(config.REQUEST_DELAY)
 
-            # 안전장치
-            if page > 500:
-                logger.warning("500페이지 초과, 중단")
-                break
-
-        logger.info(f"총 {len(posts)}개 게시글 발견")
-        return posts
+        logger.info(f"총 {len(new_posts)}개 새 게시글 발견")
+        return new_posts, last_page, is_complete
 
     def _clean_content(self, content: str) -> str:
         """본문 정리: 출처 제거, 줄바꿈 정리, 한줄코멘트 콜아웃 처리"""
@@ -672,58 +722,94 @@ url: {post['url']}
 
         return success_count
 
-    def run(self, limit: int = None):
+    def run(self, limit: int = None, initial_crawl: bool = False):
         """크롤러 실행
 
         Args:
             limit: 크롤링할 최대 게시글 수 (지정 시 새 게시글 n개 발견하면 즉시 중단)
+            initial_crawl: True면 초기 크롤링 모드 (이미 크롤링된 게시글 건너뛰고 끝까지 진행)
+                          False면 일일 자동화 모드 (최신글부터, 이미 크롤링된 게시글 만나면 중단)
         """
-        logger.info("=== 메르의 블로그 크롤러 시작 ===")
+        # 초기 크롤링 여부 자동 판단: crawl_state에 저장된 페이지가 1보다 크면 초기 크롤링 재개
+        if self.crawl_state.get('last_page', 1) > 1:
+            initial_crawl = True
+
+        mode_name = "초기 크롤링" if initial_crawl else "일일 자동화"
+        logger.info(f"=== 메르의 블로그 크롤러 시작 ({mode_name} 모드) ===")
         logger.info(f"대상 카테고리: {TARGET_CATEGORY['name']}")
         logger.info(f"저장 경로: {config.OUTPUT_DIR}")
+        logger.info(f"이미 크롤링된 게시글: {len(self.crawled_posts)}개")
+        if initial_crawl and self.crawl_state.get('last_page', 1) > 1:
+            logger.info(f"마지막 크롤링 위치: 페이지 {self.crawl_state['last_page']}")
 
         # 크롤링 결과 초기화
         self.crawl_results = []
-
-        # 1. 게시글 목록 수집 (limit 모드면 새 게시글 n개 발견 시 즉시 중단)
-        all_posts = self.get_posts_in_category(limit=limit)
-
-        if not all_posts:
-            logger.error("게시글을 찾을 수 없습니다.")
-            return
-
-        # 2. 새 게시글만 필터링
-        new_posts = [p for p in all_posts if p not in self.crawled_posts]
-        logger.info(f"새 게시글: {len(new_posts)}개 / 전체: {len(all_posts)}개")
-
-        if not new_posts:
-            logger.info("새로운 게시글이 없습니다.")
-            return
-
-        # limit 적용
-        if limit:
-            new_posts = new_posts[:limit]
-            logger.info(f"테스트 모드: {limit}개만 크롤링")
-
-        # 3. 배치 단위로 크롤링 (전체 크롤링 시 BATCH_SIZE 단위, limit 모드는 한 번에)
         total_success = 0
 
         if limit:
-            # limit 모드: 한 번에 처리
+            # limit 모드: 첫 페이지부터 지정된 개수만 수집하고 처리
+            new_posts, last_page, _ = self.get_posts_in_category(limit=limit, start_page=1, stop_on_crawled=True)
+
+            if not new_posts:
+                logger.info("새로운 게시글이 없습니다.")
+                return
+
+            logger.info(f"테스트 모드: {len(new_posts)}개 크롤링")
             total_success = self._process_batch(new_posts, 1, 1)
-        else:
-            # 전체 크롤링: BATCH_SIZE 단위로 처리
+        elif initial_crawl:
+            # 초기 크롤링 모드: 저장된 위치부터 끝까지 진행 (이미 크롤링된 게시글 건너뛰기)
             batch_size = config.BATCH_SIZE
-            total_batches = (len(new_posts) + batch_size - 1) // batch_size
+            batch_num = 0
+            current_page = None  # 첫 배치는 저장된 위치에서 시작
 
-            for batch_num in range(total_batches):
-                start_idx = batch_num * batch_size
-                end_idx = min(start_idx + batch_size, len(new_posts))
-                batch_posts = new_posts[start_idx:end_idx]
+            while True:
+                batch_num += 1
+                logger.info(f"\n=== 배치 {batch_num} 시작: 새 게시글 최대 {batch_size}개 수집 중... ===")
 
-                logger.info(f"\n=== 배치 {batch_num + 1}/{total_batches} 시작 ({len(batch_posts)}개) ===")
-                batch_success = self._process_batch(batch_posts, batch_num + 1, total_batches)
+                # 배치 크기만큼만 새 게시글 수집 (이미 크롤링된 게시글 건너뛰기)
+                new_posts, last_page, is_complete = self.get_posts_in_category(
+                    batch_size=batch_size, start_page=current_page, stop_on_crawled=False
+                )
+
+                if not new_posts:
+                    logger.info("새로운 게시글이 없습니다. 크롤링 완료.")
+                    # 초기 크롤링 완료 시 상태 초기화 (다음 실행은 일일 자동화 모드)
+                    self._save_crawl_state(1, "")
+                    break
+
+                logger.info(f"배치 {batch_num}: 새 게시글 {len(new_posts)}개 처리 시작")
+
+                # 즉시 파일 생성
+                batch_success = self._process_batch(new_posts, batch_num, -1)
                 total_success += batch_success
+
+                # 마지막 게시글 ID와 페이지 저장
+                if new_posts:
+                    self._save_crawl_state(last_page, new_posts[-1])
+                    logger.info(f"크롤링 상태 저장: 페이지 {last_page}")
+
+                # is_complete=True면 전체 완료 (더 이상 페이지 없음)
+                if is_complete:
+                    logger.info("모든 페이지 크롤링 완료.")
+                    # 초기 크롤링 완료 시 상태 초기화
+                    self._save_crawl_state(1, "")
+                    break
+
+                # 다음 배치는 마지막 페이지의 다음 페이지부터 시작
+                current_page = last_page + 1
+        else:
+            # 일일 자동화 모드: 첫 페이지부터 시작, 이미 크롤링된 게시글 만나면 중단
+            logger.info("최신글부터 수집 시작...")
+            new_posts, last_page, _ = self.get_posts_in_category(
+                start_page=1, stop_on_crawled=True
+            )
+
+            if not new_posts:
+                logger.info("새로운 게시글이 없습니다.")
+                return
+
+            logger.info(f"새 게시글 {len(new_posts)}개 발견, 크롤링 시작")
+            total_success = self._process_batch(new_posts, 1, 1)
 
         logger.info(f"\n=== 완료: {total_success}개 새 게시글 저장 ===")
 
