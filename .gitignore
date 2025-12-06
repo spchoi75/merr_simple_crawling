@@ -16,7 +16,14 @@ venv/
 
 # Project specific
 .last_crawl
+.crawl_state
 test/
+
+# Claude
+.claude/
+
+# Docs (local only)
+docs/
 
 # Logs
 *.log
