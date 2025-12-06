@@ -21,6 +21,12 @@ OUTPUT_DIR = os.path.expanduser("~/승표의보관소/Web Clipping/메르의 블
 # 크롤링 기록 파일
 CRAWLED_POSTS_FILE = os.path.join(os.path.dirname(__file__), ".last_crawl")
 
+# 크롤링 로그 저장 경로
+LOG_DIR = os.path.join(OUTPUT_DIR, "logs")
+
+# 배치 처리 설정
+BATCH_SIZE = 100  # 전체 크롤링 시 한 번에 처리할 게시글 수
+
 # 요청 설정
 REQUEST_DELAY = 1.0  # 요청 간 딜레이 (초) - 서버 부하 방지
 USER_AGENT = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"

@@ -39,6 +39,7 @@ class NaverBlogCrawler:
             'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
         })
         self.crawled_posts = self._load_crawled_posts()
+        self.crawl_results = []  # 크롤링 결과 저장 (로그용)
 
     def _load_crawled_posts(self) -> set:
         """이미 크롤링된 게시글 ID 목록 로드"""
@@ -52,6 +53,62 @@ class NaverBlogCrawler:
         with open(config.CRAWLED_POSTS_FILE, 'a', encoding='utf-8') as f:
             f.write(f"{post_id}\n")
         self.crawled_posts.add(post_id)
+
+    def _save_crawl_log(self):
+        """크롤링 로그를 md 파일로 저장"""
+        if not self.crawl_results:
+            return
+
+        os.makedirs(config.LOG_DIR, exist_ok=True)
+
+        today = datetime.now().strftime('%Y-%m-%d')
+        log_filename = f"crawl_log_{today}.md"
+        log_filepath = os.path.join(config.LOG_DIR, log_filename)
+
+        # 첫 번째와 마지막 크롤링 결과
+        first_post = self.crawl_results[0]
+        last_post = self.crawl_results[-1]
+
+        log_content = f"""---
+date: {today}
+total_crawled: {len(self.crawl_results)}
+---
+
+# 크롤링 로그 - {today}
+
+## 요약
+- **크롤링 시간**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+- **총 크롤링 수**: {len(self.crawl_results)}개
+
+## 첫 번째 글
+- **제목**: {first_post['title']}
+- **날짜**: {first_post['date']}
+
+## 마지막 글
+- **제목**: {last_post['title']}
+- **날짜**: {last_post['date']}
+
+## 전체 목록
+| 순번 | 제목 | 날짜 |
+|------|------|------|
+"""
+        for i, post in enumerate(self.crawl_results, 1):
+            # 제목에서 파이프 문자 이스케이프
+            safe_title = post['title'].replace('|', '\\|')
+            log_content += f"| {i} | {safe_title} | {post['date']} |\n"
+
+        # 기존 로그 파일이 있으면 append, 없으면 새로 생성
+        if os.path.exists(log_filepath):
+            with open(log_filepath, 'a', encoding='utf-8') as f:
+                f.write(f"\n\n---\n\n# 추가 크롤링 - {datetime.now().strftime('%H:%M:%S')}\n\n")
+                f.write(f"- **크롤링 수**: {len(self.crawl_results)}개\n")
+                f.write(f"- **첫 번째 글**: {first_post['title']} ({first_post['date']})\n")
+                f.write(f"- **마지막 글**: {last_post['title']} ({last_post['date']})\n")
+        else:
+            with open(log_filepath, 'w', encoding='utf-8') as f:
+                f.write(log_content)
+
+        logger.info(f"크롤링 로그 저장: {log_filepath}")
 
     def _fetch_page(self, url: str, use_pc_agent: bool = False) -> BeautifulSoup | None:
         """페이지 요청 및 파싱"""
@@ -77,9 +134,14 @@ class NaverBlogCrawler:
             logger.error(f"페이지 요청 실패: {url} - {e}")
             return None
 
-    def get_posts_in_category(self) -> list[str]:
-        """대상 카테고리의 모든 게시글 ID 수집 (PC 버전 사용)"""
+    def get_posts_in_category(self, limit: int = None) -> list[str]:
+        """대상 카테고리의 게시글 ID 수집 (PC 버전 사용)
+
+        Args:
+            limit: 새 게시글 수집 개수 제한 (지정 시 새 게시글 n개 발견하면 즉시 중단)
+        """
         posts = []
+        new_posts_count = 0
         page = 1
 
         while True:
@@ -89,17 +151,32 @@ class NaverBlogCrawler:
             if not soup:
                 break
 
-            # logNo 파라미터에서 게시글 ID 추출
-            page_posts = set()
-            for match in re.finditer(r'logNo=(\d+)', str(soup)):
+            # 글 목록 링크에서만 게시글 ID 추출 (본문 내 링크 제외)
+            # PostView.naver?blogId=ranto28&logNo= 패턴 사용
+            page_posts = []
+            seen_in_page = set()
+            for match in re.finditer(rf'PostView\.naver\?blogId={config.BLOG_ID}&logNo=(\d+)', str(soup)):
                 post_id = match.group(1)
-                if post_id not in posts and post_id not in page_posts:
-                    page_posts.add(post_id)
+                if post_id not in posts and post_id not in seen_in_page:
+                    seen_in_page.add(post_id)
+                    page_posts.append(post_id)
 
             if not page_posts:
                 break
 
-            posts.extend(page_posts)
+            # limit 모드: 새 게시글 수 체크
+            if limit:
+                for post_id in page_posts:
+                    posts.append(post_id)
+                    if post_id not in self.crawled_posts:
+                        new_posts_count += 1
+                        if new_posts_count >= limit:
+                            logger.info(f"페이지 {page}: 새 게시글 {limit}개 발견, 수집 중단")
+                            logger.info(f"총 {len(posts)}개 게시글 발견 (새 게시글: {new_posts_count}개)")
+                            return posts
+            else:
+                posts.extend(page_posts)
+
             logger.info(f"페이지 {page}: {len(page_posts)}개 게시글 발견 (누적: {len(posts)}개)")
 
             page += 1
@@ -428,11 +505,22 @@ class NaverBlogCrawler:
         if not title:
             title = f'제목없음_{post_id}'
 
-        # 날짜 추출 - __INITIAL_STATE__ JSON에서
+        # 날짜 추출 - blog_date 클래스에서 (예: "2025. 12. 6. 0:10")
         date_str = None
-        date_match = re.search(r'"publishDate"\s*:\s*"([^"]+)"', raw_html)
-        if date_match:
-            date_str = date_match.group(1)
+        blog_date = soup.select_one('.blog_date')
+        if blog_date:
+            date_text = blog_date.get_text(strip=True)
+            # "2025. 12. 6. 0:10" -> "2025.12.06" 형식으로 변환
+            date_match = re.search(r'(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})', date_text)
+            if date_match:
+                year, month, day = date_match.groups()
+                date_str = f"{year}.{month.zfill(2)}.{day.zfill(2)}"
+
+        # 대체: __INITIAL_STATE__ JSON에서 시도
+        if not date_str:
+            date_match = re.search(r'"publishDate"\s*:\s*"([^"]+)"', raw_html)
+            if date_match:
+                date_str = date_match.group(1)
 
         if not date_str:
             date_str = datetime.now().strftime('%Y.%m.%d')
@@ -545,18 +633,60 @@ url: {post['url']}
         logger.info(f"저장됨: {filename}")
         return filepath
 
+    def _process_batch(self, post_ids: list, batch_num: int, total_batches: int) -> int:
+        """배치 단위로 게시글 크롤링 및 저장
+
+        Args:
+            post_ids: 크롤링할 게시글 ID 목록
+            batch_num: 현재 배치 번호
+            total_batches: 전체 배치 수
+
+        Returns:
+            성공한 크롤링 수
+        """
+        success_count = 0
+        batch_results = []
+
+        for i, post_id in enumerate(post_ids, 1):
+            logger.info(f"[배치 {batch_num}/{total_batches}] [{i}/{len(post_ids)}] 게시글 {post_id} 크롤링 중...")
+
+            time.sleep(config.REQUEST_DELAY)
+
+            post = self.crawl_post(post_id)
+            if post:
+                self.save_as_markdown(post)
+                self._save_crawled_post(post_id)
+                success_count += 1
+                batch_results.append({
+                    'title': post['title'],
+                    'date': post['date']
+                })
+
+        # 배치 결과를 전체 결과에 추가
+        self.crawl_results.extend(batch_results)
+
+        # 배치 완료 후 즉시 로그 저장 (중간 오류 대비)
+        if batch_results:
+            self._save_crawl_log()
+            logger.info(f"배치 {batch_num} 완료: {success_count}개 저장, 로그 갱신됨")
+
+        return success_count
+
     def run(self, limit: int = None):
         """크롤러 실행
 
         Args:
-            limit: 크롤링할 최대 게시글 수 (테스트용)
+            limit: 크롤링할 최대 게시글 수 (지정 시 새 게시글 n개 발견하면 즉시 중단)
         """
         logger.info("=== 메르의 블로그 크롤러 시작 ===")
         logger.info(f"대상 카테고리: {TARGET_CATEGORY['name']}")
         logger.info(f"저장 경로: {config.OUTPUT_DIR}")
 
-        # 1. 게시글 목록 수집
-        all_posts = self.get_posts_in_category()
+        # 크롤링 결과 초기화
+        self.crawl_results = []
+
+        # 1. 게시글 목록 수집 (limit 모드면 새 게시글 n개 발견 시 즉시 중단)
+        all_posts = self.get_posts_in_category(limit=limit)
 
         if not all_posts:
             logger.error("게시글을 찾을 수 없습니다.")
@@ -575,20 +705,27 @@ url: {post['url']}
             new_posts = new_posts[:limit]
             logger.info(f"테스트 모드: {limit}개만 크롤링")
 
-        # 3. 각 게시글 크롤링 및 저장
-        success_count = 0
-        for i, post_id in enumerate(new_posts, 1):
-            logger.info(f"[{i}/{len(new_posts)}] 게시글 {post_id} 크롤링 중...")
+        # 3. 배치 단위로 크롤링 (전체 크롤링 시 BATCH_SIZE 단위, limit 모드는 한 번에)
+        total_success = 0
 
-            time.sleep(config.REQUEST_DELAY)
+        if limit:
+            # limit 모드: 한 번에 처리
+            total_success = self._process_batch(new_posts, 1, 1)
+        else:
+            # 전체 크롤링: BATCH_SIZE 단위로 처리
+            batch_size = config.BATCH_SIZE
+            total_batches = (len(new_posts) + batch_size - 1) // batch_size
 
-            post = self.crawl_post(post_id)
-            if post:
-                self.save_as_markdown(post)
-                self._save_crawled_post(post_id)
-                success_count += 1
+            for batch_num in range(total_batches):
+                start_idx = batch_num * batch_size
+                end_idx = min(start_idx + batch_size, len(new_posts))
+                batch_posts = new_posts[start_idx:end_idx]
 
-        logger.info(f"\n=== 완료: {success_count}개 새 게시글 저장 ===")
+                logger.info(f"\n=== 배치 {batch_num + 1}/{total_batches} 시작 ({len(batch_posts)}개) ===")
+                batch_success = self._process_batch(batch_posts, batch_num + 1, total_batches)
+                total_success += batch_success
+
+        logger.info(f"\n=== 완료: {total_success}개 새 게시글 저장 ===")
 
 
 if __name__ == '__main__':
