@@ -168,8 +168,8 @@ total_crawled: {len(self.crawl_results)}
 
         Returns:
             (새 게시글 ID 목록, 마지막으로 탐색한 페이지 번호, 전체 완료 여부)
-            - 전체 완료 = True: 더 이상 페이지가 없거나, 이미 크롤링된 게시글 발견(stop_on_crawled=True)
-            - 전체 완료 = False: batch_size 도달로 중단 (계속 진행 필요)
+            - 전체 완료 = True: 더 이상 페이지가 없음 (빈 페이지 발견)
+            - 전체 완료 = False: batch_size 도달로 중단 또는 stop_on_crawled로 중단 (계속 진행 필요할 수 있음)
         """
         new_posts = []  # 새 게시글만 수집
 
@@ -187,6 +187,10 @@ total_crawled: {len(self.crawl_results)}
         last_page = page
         is_complete = False  # 전체 완료 여부
 
+        # 연속으로 새 게시글이 없는 페이지 수 카운트 (조기 종료 방지)
+        consecutive_no_new = 0
+        MAX_CONSECUTIVE_NO_NEW = 10  # 연속 10페이지 동안 새 게시글 없으면 계속 진행하되 경고
+
         while True:
             url = f"https://blog.naver.com/PostList.naver?blogId={config.BLOG_ID}&categoryNo={TARGET_CATEGORY['no']}&currentPage={page}"
             soup = self._fetch_page(url, use_pc_agent=True)
@@ -195,19 +199,34 @@ total_crawled: {len(self.crawl_results)}
                 is_complete = True  # 페이지 로드 실패 = 끝
                 break
 
-            # 글 목록 링크에서만 게시글 ID 추출 (본문 내 링크 제외)
-            # PostView.naver?blogId=ranto28&logNo= 패턴 사용
+            # 글 목록에서 게시글 ID 추출
+            # aPostBaseInfo 배열에서 추출 (가장 신뢰할 수 있는 방법)
+            # 형식: aPostBaseInfo[1] = "게시글ID|...|페이지|카테고리|..."
             page_posts = []
             seen_in_page = set()
-            for match in re.finditer(rf'PostView\.naver\?blogId={config.BLOG_ID}&logNo=(\d+)', str(soup)):
+            html_str = str(soup)
+
+            # 방법 1: aPostBaseInfo에서 카테고리 21 게시글 추출
+            for match in re.finditer(r'aPostBaseInfo\[\d+\]\s*=\s*"(\d+)\|[^"]*\|' + TARGET_CATEGORY['no'] + r'\|', html_str):
                 post_id = match.group(1)
                 if post_id not in seen_in_page:
                     seen_in_page.add(post_id)
                     page_posts.append(post_id)
 
+            # 방법 2: PostView.naver 패턴 (폴백)
+            if not page_posts:
+                for match in re.finditer(rf'PostView\.naver\?blogId={config.BLOG_ID}&logNo=(\d+)', html_str):
+                    post_id = match.group(1)
+                    if post_id not in seen_in_page:
+                        seen_in_page.add(post_id)
+                        page_posts.append(post_id)
+
             if not page_posts:
                 is_complete = True  # 더 이상 게시글 없음 = 끝
                 break
+
+            # 페이지 내 새 게시글 수 카운트
+            new_in_page = 0
 
             # 페이지 내 게시글 처리
             for post_id in page_posts:
@@ -216,8 +235,8 @@ total_crawled: {len(self.crawl_results)}
                     if stop_on_crawled:
                         # 일일 자동화 모드: 이미 크롤링된 게시글을 만나면 즉시 중단
                         logger.info(f"페이지 {page}: 이미 크롤링된 게시글 발견 (ID: {post_id}), 수집 중단")
-                        is_complete = True
-                        return new_posts, last_page, is_complete
+                        # stop_on_crawled 모드에서는 is_complete=False로 반환 (다음 실행 시 같은 동작)
+                        return new_posts, last_page, False
                     else:
                         # 초기 크롤링 모드: 건너뛰고 계속 진행
                         continue
@@ -225,11 +244,21 @@ total_crawled: {len(self.crawl_results)}
                 # 새 게시글 추가 (중복 체크)
                 if post_id not in new_posts:
                     new_posts.append(post_id)
+                    new_in_page += 1
 
                     # target_count에 도달하면 즉시 반환 (계속 진행 필요)
                     if target_count and len(new_posts) >= target_count:
                         logger.info(f"페이지 {page}: 새 게시글 {target_count}개 발견, 배치 중단")
                         return new_posts, page, False  # is_complete=False
+
+            # 이 페이지에서 새 게시글이 있었는지 체크
+            if new_in_page > 0:
+                consecutive_no_new = 0
+            else:
+                consecutive_no_new += 1
+                if consecutive_no_new >= MAX_CONSECUTIVE_NO_NEW:
+                    logger.warning(f"페이지 {page}: 연속 {MAX_CONSECUTIVE_NO_NEW}페이지 동안 새 게시글 없음, 계속 진행...")
+                    consecutive_no_new = 0  # 리셋하고 계속 진행
 
             logger.info(f"페이지 {page}: {len(page_posts)}개 게시글 확인 (새 게시글 누적: {len(new_posts)}개)")
 
@@ -771,11 +800,24 @@ url: {post['url']}
                     batch_size=batch_size, start_page=current_page, stop_on_crawled=False
                 )
 
-                if not new_posts:
-                    logger.info("새로운 게시글이 없습니다. 크롤링 완료.")
-                    # 초기 크롤링 완료 시 상태 초기화 (다음 실행은 일일 자동화 모드)
+                # is_complete=True면 전체 완료 (더 이상 페이지 없음 = 빈 페이지 발견)
+                if is_complete:
+                    if new_posts:
+                        # 마지막 배치 처리
+                        logger.info(f"배치 {batch_num}: 마지막 배치, 새 게시글 {len(new_posts)}개 처리")
+                        batch_success = self._process_batch(new_posts, batch_num, -1)
+                        total_success += batch_success
+                    logger.info("모든 페이지 크롤링 완료.")
+                    # 초기 크롤링 완료 시 상태 초기화
                     self._save_crawl_state(1, "")
                     break
+
+                if not new_posts:
+                    # is_complete=False인데 new_posts가 비어있음 = 현재 페이지 범위에서 새 게시글 없음
+                    # 다음 페이지로 계속 진행
+                    logger.info(f"페이지 {last_page}: 새 게시글 없음, 다음 페이지로 계속...")
+                    current_page = last_page + 1
+                    continue
 
                 logger.info(f"배치 {batch_num}: 새 게시글 {len(new_posts)}개 처리 시작")
 
@@ -784,16 +826,8 @@ url: {post['url']}
                 total_success += batch_success
 
                 # 마지막 게시글 ID와 페이지 저장
-                if new_posts:
-                    self._save_crawl_state(last_page, new_posts[-1])
-                    logger.info(f"크롤링 상태 저장: 페이지 {last_page}")
-
-                # is_complete=True면 전체 완료 (더 이상 페이지 없음)
-                if is_complete:
-                    logger.info("모든 페이지 크롤링 완료.")
-                    # 초기 크롤링 완료 시 상태 초기화
-                    self._save_crawl_state(1, "")
-                    break
+                self._save_crawl_state(last_page, new_posts[-1])
+                logger.info(f"크롤링 상태 저장: 페이지 {last_page}")
 
                 # 다음 배치는 마지막 페이지의 다음 페이지부터 시작
                 current_page = last_page + 1
